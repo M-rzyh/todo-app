@@ -1,6 +1,6 @@
 // Offline support: serve the app shell from cache, refresh it in the background.
 // Google APIs always go to the network.
-const CACHE = 'todo-v1';
+const CACHE = 'todo-v2';
 const SHELL = ['./', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon.svg',
   'js/app.js', 'js/config.js', 'js/dates.js', 'js/gcal.js', 'js/meta.js', 'js/parser.js'];
 

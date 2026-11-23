@@ -10,7 +10,11 @@ A Todoist-style to-do list that stores every task in **Google Calendar**, so it 
 
 ## How tasks are stored
 
-All tasks live on a dedicated Google Calendar named **To-Do**, which the app creates on first sign-in.
+You can connect **several Google accounts** (e.g. personal Gmail and ualberta.ca). Each account gets its own **To-Do** calendar, which the app creates on first sign-in, and the app shows the tasks from all of them together. When adding a task, you pick the **Account** it belongs to. Editing a task lets you move it to another account.
+
+Picking **No account** stores the task privately in the hidden app-data folder of your first connected account's Google Drive. It syncs between your devices but never appears on any calendar, and you won't see it as a file in Drive either.
+
+Each connected account's To-Do calendar works like this:
 
 | Task field  | Google Calendar event |
 |-------------|----------------------|
@@ -39,17 +43,21 @@ Keyboard shortcuts: `q` add task, `/` search, `t` Today, `u` Upcoming, `r` sync.
 ## Connect Google Calendar (one-time, about 10 minutes)
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/projectcreate) and create a project called `todo-app`.
-2. Enable the [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com).
+2. Enable the [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com) and the [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com). Drive is used only for "No account" tasks.
 3. Open [Google Auth Platform](https://console.cloud.google.com/auth/overview) and click **Get started**:
    - App name `To-Do`, support email: your email
    - Audience: **External**
    - Contact email: your email, then **Create**
-4. Under **Audience → Test users**, add your own Google account.
+4. Under **Audience → Test users**, add **every** Google account you want to connect.
 5. Under **Clients → Create client**:
    - Type: **Web application**
    - Authorized JavaScript origins: `https://m-rzyh.github.io` (and `http://localhost:8000` if you also want to run it locally)
    - Copy the **Client ID**.
 6. Open the app, paste the Client ID, and click **Connect Google Calendar**. You can also put it in `js/config.js` so it works on every device without pasting.
+
+To connect another account, go to **Settings → + Add another Google account**.
+
+> University or work accounts (like ualberta.ca) are managed by an administrator, who may block apps that Google hasn't verified. If Google says the app is blocked for that account, keep its tasks in a personal account or under "No account".
 
 > Google shows an "unverified app" warning because the app is in testing mode and only for you. Click **Continue**. Sign-in lasts about an hour, after which the app shows a **Reconnect** button.
 
@@ -67,6 +75,8 @@ In the **Shortcuts** app on iPhone or Mac:
 2. Add the action **Dictate Text** (or *Ask for Input* if you'd rather type).
 3. Add **URL Encode** using the *Dictated Text*.
 4. Add **Open URLs** with `https://m-rzyh.github.io/todo-app/?add=` followed by the *URL Encoded Text* variable.
+
+Tasks added this way go to your default account: the one you used last, which you can change in Settings.
 
 Now say "Hey Siri, add to my to-do list", then something like "call the dentist Friday at 9am p2". The app opens and adds the task.
 

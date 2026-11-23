@@ -2,13 +2,16 @@ import { CONFIG } from './config.js';
 import { today, addDays, diffDays, fmtRelative, fmtLong, fmtTime, parseYmd, weekday, WD_CODES, MONTHS } from './dates.js';
 import { parseQuickAdd } from './parser.js';
 import { eventToTask, taskToEvent, rruleToRecurrence, describeRecurrence, DONE_PREFIX } from './meta.js';
-import { GoogleBackend, MockBackend, AuthError, getClientId, getCalendarName } from './gcal.js';
+import {
+  AuthError, getClientId, getCalendarName, NO_ACCOUNT,
+  GoogleAccount, CalendarSource, EventStore, LocalPersistence, DrivePersistence,
+  loadAccounts, saveAccounts, nextColor,
+} from './gcal.js';
 
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const LS = (k) => `todo.${k}`;
-
 const ICON = {
   check: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M9.5 16.2 5.3 12l-1.4 1.4 5.6 5.6L20.1 8.4 18.7 7z"/></svg>',
   cal: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2V2h-2v2H9V2zM5 9h14v10H5z"/></svg>',
@@ -23,9 +26,16 @@ const ICON = {
 };
 const PRIO_NAMES = { 1: 'Priority 1', 2: 'Priority 2', 3: 'Priority 3', 4: 'Priority 4' };
 const PRIO_COLORS = { 1: 'var(--p1)', 2: 'var(--p2)', 3: 'var(--p3)', 4: 'var(--p4)' };
+const NO_ACCOUNT_LABEL = 'No account';
+const NO_ACCOUNT_COLOR = '#808080';
 
 const state = {
-  backend: null,
+  mode: null,              // 'google' | 'demo'
+  accounts: [],            // GoogleAccount[]
+  sources: new Map(),      // id → source (one per account, plus NO_ACCOUNT)
+  ready: new Set(),        // source ids that finished init()
+  bySource: new Map(),     // id → tasks[]
+  expired: new Set(),      // account emails that need reconnecting
   tasks: [],
   view: { type: localStorage.getItem(LS('view')) || 'today' },
   showCompleted: localStorage.getItem(LS('showCompleted')) === '1',
@@ -33,7 +43,6 @@ const state = {
   weekStart: null,
   lastSync: null,
   syncing: false,
-  authLost: false,
 };
 
 // ===========================================================================
@@ -54,12 +63,51 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 
 function boot() {
-  const mode = localStorage.getItem(LS('mode'));
-  if (mode === 'demo') { state.backend = new MockBackend(); return start(); }
+  if (localStorage.getItem(LS('mode')) === 'demo') { state.mode = 'demo'; buildSources(); return start(); }
   if (!getClientId()) return showSetup();
-  state.backend = new GoogleBackend();
-  if (state.backend.hasValidToken()) return start();
-  showSignIn();
+  state.mode = 'google';
+  state.accounts = loadAccounts();
+  if (!state.accounts.length || !state.accounts.some((a) => a.hasValidToken())) return showSignIn();
+  buildSources();
+  start();
+}
+
+function buildSources() {
+  const old = state.sources;
+  state.sources = new Map();
+  if (state.mode === 'demo') {
+    const demo = [
+      { id: 'me@gmail.com', color: '#dc4c3e', key: 'demoEvents' },
+      { id: 'me@ualberta.ca', color: '#246fe0', key: 'demoEvents2' },
+      { id: NO_ACCOUNT, label: NO_ACCOUNT_LABEL, color: NO_ACCOUNT_COLOR, key: 'demoNone' },
+    ];
+    for (const d of demo) state.sources.set(d.id, new EventStore({ id: d.id, label: d.label || d.id, kind: 'demo', color: d.color, persistence: new LocalPersistence(LS(d.key)) }));
+  } else {
+    for (const a of state.accounts) state.sources.set(a.email, old.get(a.email)?.account === a ? old.get(a.email) : new CalendarSource(a, persistAccounts));
+    const storage = storageAccount();
+    if (storage) {
+      const prev = old.get(NO_ACCOUNT);
+      state.sources.set(NO_ACCOUNT, prev?.account === storage ? prev : Object.assign(
+        new EventStore({ id: NO_ACCOUNT, label: NO_ACCOUNT_LABEL, kind: 'drive', color: NO_ACCOUNT_COLOR, persistence: new DrivePersistence(storage) }),
+        { account: storage }));
+    }
+  }
+  for (const id of [...state.ready]) if (!state.sources.has(id)) state.ready.delete(id);
+  for (const id of [...state.bySource.keys()]) if (!state.sources.has(id)) state.bySource.delete(id);
+}
+
+const storageAccount = () => state.accounts.find((a) => a.storage) || null;
+const accountOf = (sourceId) => state.sources.get(sourceId)?.account || null;
+function persistAccounts() { if (state.mode === 'google') saveAccounts(state.accounts); }
+
+function sourceLabel(id) { return id === NO_ACCOUNT ? NO_ACCOUNT_LABEL : id; }
+function sourceShort(id) { return id === NO_ACCOUNT ? NO_ACCOUNT_LABEL : id.split('@')[0] + '@' + (id.split('@')[1] || '').split('.')[0]; }
+function sourceColor(id) { return state.sources.get(id)?.color || NO_ACCOUNT_COLOR; }
+
+function defaultSource() {
+  const saved = localStorage.getItem(LS('defaultSource'));
+  if (saved && state.sources.has(saved)) return saved;
+  return [...state.sources.keys()][0] || NO_ACCOUNT;
 }
 
 function showScreen(html) {
@@ -77,8 +125,8 @@ function showSetup(error = '') {
       <p>Your tasks are stored as events on a <b>“${esc(getCalendarName())}”</b> calendar in your Google account, so they sync everywhere automatically. One-time setup (about 10 minutes):</p>
       <ol>
         <li>Open <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">Google Cloud Console</a> and create a project (e.g. “todo-app”).</li>
-        <li>Enable the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" rel="noopener">Google Calendar API</a>.</li>
-        <li>Under <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google Auth Platform</a>, set up branding (app name “To-Do”, your email), audience <b>External</b>, and add yourself as a <b>Test user</b>.</li>
+        <li>Enable the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" rel="noopener">Google Calendar API</a> and the <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noopener">Google Drive API</a>.</li>
+        <li>Under <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google Auth Platform</a>, set up branding (app name “To-Do”, your email), audience <b>External</b>, and add every Google account you'll use as a <b>Test user</b>.</li>
         <li>Under <a href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener">Clients</a>, create an OAuth client of type <b>Web application</b> with the authorized JavaScript origin <code>${esc(origin)}</code>.</li>
         <li>Paste the Client ID below.</li>
       </ol>
@@ -96,21 +144,25 @@ function showSetup(error = '') {
     const v = $('#client-id', s).value.trim();
     if (!/\.apps\.googleusercontent\.com$/.test(v)) return showSetup('That doesn’t look like a Client ID (it ends with .apps.googleusercontent.com).');
     localStorage.setItem(LS('clientId'), v);
-    state.backend = new GoogleBackend();
-    showSignIn();
+    boot();
   };
-  $('#demo', s).onclick = () => { localStorage.setItem(LS('mode'), 'demo'); seedDemo(); boot(); };
+  $('#demo', s).onclick = enterDemo;
 }
 
-function showSignIn(message = '') {
+function enterDemo() { localStorage.setItem(LS('mode'), 'demo'); seedDemo(); boot(); }
+
+function showSignIn() {
+  const known = state.accounts;
   const s = showScreen(`
     <div class="card" style="text-align:center">
       <img src="icons/icon.svg" width="56" height="56" alt="">
       <h1>To-Do</h1>
-      <p>${esc(message || 'Sign in with Google to load your tasks from Google Calendar.')}</p>
+      <p>${known.length ? 'Your Google session expired. Reconnect to load your tasks.' : 'Sign in with Google to load your tasks from Google Calendar.'}</p>
       ${pendingAdds().length ? `<p><b>Waiting to add:</b> ${pendingAdds().map(esc).join(', ')}</p>` : ''}
-      <div class="row" style="justify-content:center">
-        <button class="btn primary big" id="signin">Connect Google Calendar</button>
+      <div class="row" style="justify-content:center;flex-direction:column;align-items:center">
+        ${known.length
+          ? known.map((a, i) => `<button class="btn primary big" data-i="${i}">Reconnect ${esc(a.email || 'Google account')}</button>`).join('')
+          : '<button class="btn primary big" data-i="new">Connect Google Calendar</button>'}
       </div>
       <p id="err" class="error"></p>
       <details><summary>Other options</summary>
@@ -120,30 +172,52 @@ function showSignIn(message = '') {
         </div>
       </details>
     </div>`);
-  $('#signin', s).onclick = async () => {
-    try { await state.backend.signIn(); start(); }
-    catch (e) { $('#err', s).textContent = e.message; }
-  };
+  $$('[data-i]', s).forEach((b) => b.onclick = async () => {
+    try {
+      if (b.dataset.i === 'new') await connectNewAccount({ first: true });
+      else await reconnect(known[+b.dataset.i]);
+      buildSources(); start();
+    } catch (e) { $('#err', s).textContent = e.message; }
+  });
   $('#change-client', s).onclick = () => { localStorage.removeItem(LS('clientId')); showSetup(); };
-  $('#demo', s).onclick = () => { localStorage.setItem(LS('mode'), 'demo'); seedDemo(); boot(); };
+  $('#demo', s).onclick = enterDemo;
+}
+
+async function connectNewAccount({ first = false } = {}) {
+  const acct = new GoogleAccount({ storage: first || !storageAccount(), color: nextColor(state.accounts) });
+  await acct.signIn({ chooseAccount: true });
+  const existing = state.accounts.find((a) => a.email === acct.email);
+  if (existing) { existing.token = acct.token; state.expired.delete(existing.email); }
+  else state.accounts.push(acct);
+  persistAccounts();
+  return existing || acct;
+}
+
+async function reconnect(acct) {
+  const expected = acct.email;
+  const backup = acct.token;
+  await acct.signIn();
+  if (expected && acct.email !== expected) {
+    const other = acct.email; acct.email = expected; acct.token = backup;
+    throw new Error(`You signed in as ${other}, but this button reconnects ${expected}. Please pick ${expected}.`);
+  }
+  state.expired.delete(acct.email);
+  persistAccounts();
 }
 
 let started = false;
 async function start() {
   $('#screen').hidden = true;
   $('#app').hidden = false;
-  if (!started) { started = true; wireUi(); }
+  if (!started) {
+    started = true; wireUi();
+    setInterval(() => { if (!document.hidden) refresh(); }, 120000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  }
   render();
-  try {
-    setSyncing(true);
-    await state.backend.init();
-    await refresh();
-    await processPendingAdds();
-    if (openNewOnStart) openEditor();
-  } catch (e) { handleError(e); }
-  finally { setSyncing(false); }
-  setInterval(() => { if (!document.hidden) refresh(); }, 120000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  await refresh();
+  await processPendingAdds();
+  if (openNewOnStart) openEditor();
 }
 
 function pendingAdds() { return JSON.parse(localStorage.getItem(LS('pendingAdds')) || '[]'); }
@@ -151,10 +225,12 @@ function pendingAdds() { return JSON.parse(localStorage.getItem(LS('pendingAdds'
 async function processPendingAdds() {
   const list = pendingAdds();
   if (!list.length) return;
+  const target = defaultSource();
+  if (!canWrite(target)) return; // wait until that account is reconnected
   localStorage.removeItem(LS('pendingAdds'));
   for (const text of list) {
     const p = parseQuickAdd(text);
-    await createTask({ name: p.name || text, description: p.description, date: p.date || today(), time: p.time, priority: p.priority, labels: p.labels, recurrence: p.recurrence, done: false }, { quiet: true });
+    await createTask({ name: p.name || text, description: p.description, date: p.date || today(), time: p.time, priority: p.priority, labels: p.labels, recurrence: p.recurrence, done: false, source: target }, { quiet: true });
   }
   toast(list.length === 1 ? `Added “${parseQuickAdd(list[0]).name || list[0]}”` : `Added ${list.length} tasks`);
 }
@@ -162,31 +238,59 @@ async function processPendingAdds() {
 // ===========================================================================
 // Data
 // ===========================================================================
-async function refresh() {
-  if (!state.backend || state.syncing && state.lastSync) return;
-  if (state.authLost) return;
-  try {
-    setSyncing(true);
-    const t = today();
-    const events = await state.backend.list(addDays(t, -CONFIG.FETCH_DAYS_BACK), addDays(t, CONFIG.FETCH_DAYS_AHEAD));
-    state.tasks = events.map(eventToTask).filter((x) => x.date);
-    state.lastSync = new Date();
-    render();
-  } catch (e) { handleError(e); }
-  finally { setSyncing(false); }
+function canWrite(sourceId) {
+  const acct = accountOf(sourceId);
+  return !acct || (acct.hasValidToken() && !state.expired.has(acct.email));
 }
+
+async function refresh() {
+  if (state.syncing) return;
+  setSyncing(true);
+  const t = today();
+  const [from, to] = [addDays(t, -CONFIG.FETCH_DAYS_BACK), addDays(t, CONFIG.FETCH_DAYS_AHEAD)];
+  await Promise.all([...state.sources.values()].map(async (src) => {
+    const acct = src.account;
+    if (acct && !acct.hasValidToken()) { state.expired.add(acct.email); return; }
+    try {
+      if (!state.ready.has(src.id)) { await src.init(); state.ready.add(src.id); }
+      const events = await src.list(from, to);
+      state.bySource.set(src.id, events.map((ev) => {
+        const task = eventToTask(ev);
+        task.source = src.id; task.key = `${src.id}::${task.id}`;
+        task.seriesKey = task.seriesId ? `${src.id}::${task.seriesId}` : null;
+        return task;
+      }).filter((x) => x.date));
+    } catch (e) {
+      if (e instanceof AuthError) state.expired.add(acct?.email || e.email);
+      else { console.error(e); toast(`${sourceLabel(src.id)}: ${e.message}`); }
+    }
+  }));
+  rebuildTasks();
+  state.lastSync = new Date();
+  setSyncing(false);
+  updateBanner();
+  render();
+}
+
+function rebuildTasks() { state.tasks = [...state.bySource.values()].flat(); }
 
 function handleError(e) {
   console.error(e);
-  if (e instanceof AuthError) {
-    state.authLost = true;
-    showBanner('Your Google session expired.', 'Reconnect', async () => {
-      try { await state.backend.signIn(); state.authLost = false; hideBanner(); await state.backend.init(); await refresh(); await processPendingAdds(); }
-      catch (err) { toast(err.message); }
-    });
-  } else {
-    toast(e.message || 'Something went wrong');
-  }
+  if (e instanceof AuthError) { state.expired.add(e.email); updateBanner(); toast(`Please reconnect ${e.email || 'your Google account'} and try again.`); }
+  else toast(e.message || 'Something went wrong');
+}
+
+function updateBanner() {
+  const list = state.accounts.filter((a) => state.expired.has(a.email));
+  const b = $('#banner');
+  if (!list.length) { b.hidden = true; return; }
+  b.hidden = false;
+  b.innerHTML = `<span>Reconnect to sync:</span>${list.map((a) => `<button data-email="${esc(a.email)}">${esc(a.email)}</button>`).join('')}`;
+  $$('button', b).forEach((btn) => btn.onclick = async () => {
+    const acct = state.accounts.find((a) => a.email === btn.dataset.email);
+    try { await reconnect(acct); state.ready.delete(acct.email); if (acct.storage) state.ready.delete(NO_ACCOUNT); await refresh(); await processPendingAdds(); }
+    catch (err) { toast(err.message); }
+  });
 }
 
 function setSyncing(on) {
@@ -194,7 +298,7 @@ function setSyncing(on) {
   $('[data-action="refresh"]')?.classList.toggle('spin', on);
   const el = $('#sync-status');
   if (!el) return;
-  const where = state.backend?.kind === 'demo' ? 'Demo mode' : '';
+  const where = state.mode === 'demo' ? 'Demo mode' : '';
   el.textContent = on ? 'Syncing…' : state.lastSync ? `${where ? where + ' · ' : ''}Synced ${state.lastSync.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : where;
 }
 
@@ -215,11 +319,11 @@ function overdue() {
   for (const t of state.tasks) {
     if (t.date >= td) continue;
     if (!t.recurring) { if (!t.done) out.push(t); continue; }
-    const prev = latestPast.get(t.seriesId);
-    if (!prev || t.date > prev.date) latestPast.set(t.seriesId, t);
+    const prev = latestPast.get(t.seriesKey);
+    if (!prev || t.date > prev.date) latestPast.set(t.seriesKey, t);
   }
   for (const t of latestPast.values()) {
-    if (!t.done && !state.tasks.some((x) => x.seriesId === t.seriesId && x.date === td)) out.push(t);
+    if (!t.done && !state.tasks.some((x) => x.seriesKey === t.seriesKey && x.date === td)) out.push(t);
   }
   return out.sort(sortTasks);
 }
@@ -257,6 +361,13 @@ function renderSidebar() {
   $('#nav-labels').innerHTML = labels.length
     ? labels.map((l) => navLink(`label:${l}`, l, `<span style="color:var(--week);display:grid">${ICON.tag.replace('<svg', '<svg width="15" height="15"')}</span>`, undone.filter((t) => !t.done && t.labels.includes(l)).length || '')).join('')
     : '<div style="padding:4px 8px;color:var(--muted);font-size:12px">Add labels with #name when creating a task.</div>';
+  const multi = state.sources.size > 1;
+  $('#accounts-wrap').hidden = !multi;
+  if (multi) {
+    $('#nav-accounts').innerHTML = [...state.sources.keys()].map((id) => navLink(`source:${id}`, sourceLabel(id),
+      `<span class="acct-dot" style="background:${sourceColor(id)}"></span>`,
+      (state.expired.has(id) || (id === NO_ACCOUNT && storageAccount() && state.expired.has(storageAccount().email))) ? '⚠︎' : undone.filter((t) => t.source === id).length || '')).join('');
+  }
   $('#show-completed').checked = state.showCompleted;
 }
 
@@ -300,6 +411,11 @@ function renderContent() {
     const p = +v.type.split(':')[1];
     const list = [...overdue(), ...state.tasks.filter((t) => t.date >= td && visible(t))].filter((t) => t.priority === p);
     html = title(PRIO_NAMES[p], `${list.filter((t) => !t.done).length} open`) + (groupedByDay(dedupeRecurring(list), { addButtons: false, preset: { priority: p } }) || empty('No tasks with this priority', ''));
+  } else if (v.type.startsWith('source:')) {
+    const id = v.type.slice(7);
+    const list = [...overdue(), ...state.tasks.filter((t) => t.date >= td && visible(t))].filter((t) => t.source === id);
+    const sub = id === NO_ACCOUNT ? 'Private tasks, synced but not on any calendar' : `${list.filter((t) => !t.done).length} open · “${getCalendarName()}” calendar`;
+    html = title(sourceLabel(id), sub) + (groupedByDay(dedupeRecurring(list), { addButtons: true, preset: { source: id } }) || empty('No tasks here yet', ''));
   } else if (v.type.startsWith('label:')) {
     const l = v.type.slice(6);
     const list = [...overdue(), ...state.tasks.filter((t) => t.date >= td && visible(t))].filter((t) => t.labels.includes(l));
@@ -313,8 +429,8 @@ function dedupeRecurring(list) {
   const seen = new Set();
   return list.sort(sortTasks).filter((t) => {
     if (!t.recurring) return true;
-    if (seen.has(t.seriesId)) return false;
-    seen.add(t.seriesId); return true;
+    if (seen.has(t.seriesKey)) return false;
+    seen.add(t.seriesKey); return true;
   });
 }
 
@@ -367,8 +483,9 @@ function taskRow(t, { showDate } = {}) {
   }
   if (t.recurring) meta.push(`<span title="Repeats">${ICON.repeat}</span>`);
   t.labels.forEach((l) => meta.push(`<span class="lbl">${ICON.tag}${esc(l)}</span>`));
+  if (state.sources.size > 1 && !state.view.type.startsWith('source:')) meta.push(`<span class="acct" title="${esc(sourceLabel(t.source))}"><span class="acct-dot" style="background:${sourceColor(t.source)}"></span>${esc(sourceShort(t.source))}</span>`);
   const firstLine = t.description.split('\n').find((x) => x.trim()) || '';
-  return `<div class="task p${t.priority} ${t.done ? 'done' : ''}" data-id="${esc(t.id)}">
+  return `<div class="task p${t.priority} ${t.done ? 'done' : ''}" data-id="${esc(t.key)}">
     <button class="check" data-action="toggle" aria-label="${t.done ? 'Mark not done' : 'Complete'}">${ICON.check}</button>
     <div class="t-body">
       <div class="t-name">${esc(t.name)}</div>
@@ -403,29 +520,37 @@ function weekStrip() {
 // ===========================================================================
 // Actions
 // ===========================================================================
-const findTask = (id) => state.tasks.find((t) => t.id === id);
+const findTask = (key) => state.tasks.find((t) => t.key === key);
+const src = (t) => state.sources.get(t.source);
+
+function setSourceTasks(id, fn) {
+  state.bySource.set(id, fn(state.bySource.get(id) || []));
+  rebuildTasks();
+}
 
 async function createTask(data, { quiet } = {}) {
-  const temp = { ...data, id: 'tmp' + Math.random(), recurring: !!data.recurrence, seriesId: null };
-  state.tasks.push(temp); render();
+  const sourceId = data.source && state.sources.has(data.source) ? data.source : defaultSource();
+  const temp = { ...data, source: sourceId, id: 'tmp' + Math.random(), recurring: !!data.recurrence, seriesId: null };
+  temp.key = `${sourceId}::${temp.id}`; temp.seriesKey = null;
+  setSourceTasks(sourceId, (l) => [...l, temp]); render();
   try {
-    await state.backend.insert(taskToEvent(data, { durationMin: CONFIG.DEFAULT_DURATION_MIN }));
-    if (!quiet) toast(`Added “${data.name}”${data.date !== today() ? ` · ${fmtRelative(data.date)}` : ''}`);
-    await refresh();
+    await state.sources.get(sourceId).insert(taskToEvent(data, { durationMin: CONFIG.DEFAULT_DURATION_MIN }));
+    if (!quiet) toast(`Added “${data.name}”${data.date !== today() ? ` · ${fmtRelative(data.date)}` : ''}${state.sources.size > 1 ? ` · ${sourceShort(sourceId)}` : ''}`);
   } catch (e) {
-    state.tasks = state.tasks.filter((t) => t !== temp); render(); handleError(e);
+    setSourceTasks(sourceId, (l) => l.filter((t) => t !== temp)); render(); handleError(e);
   }
+  await refresh();
 }
 
 async function toggleDone(t) {
   const before = t.done;
   t.done = !t.done; render();
   try {
-    await state.backend.patch(t.id, {
+    await src(t).patch(t.id, {
       summary: (t.done ? DONE_PREFIX : '') + t.name,
       extendedProperties: { private: { todoApp: '1', done: t.done ? '1' : '0' } },
     });
-    if (t.done) toast(`Completed “${t.name}”`, 'Undo', () => toggleDone(findTask(t.id) || t));
+    if (t.done) toast(`Completed “${t.name}”`, 'Undo', () => toggleDone(findTask(t.key) || t));
     refresh();
   } catch (e) { t.done = before; render(); handleError(e); }
 }
@@ -443,11 +568,11 @@ async function deleteTask(t) {
     const ok = await choose(`Delete “${t.name}”?`, [{ value: 'yes', label: 'Delete', cls: 'danger' }, { value: '', label: 'Cancel' }]);
     if (!ok) return false;
   }
-  const backup = state.tasks;
-  state.tasks = state.tasks.filter((x) => scope === 'all' ? x.seriesId !== t.seriesId : x.id !== t.id);
+  const backup = state.bySource.get(t.source) || [];
+  setSourceTasks(t.source, (l) => l.filter((x) => scope === 'all' ? x.seriesId !== t.seriesId : x.id !== t.id));
   render();
-  try { await state.backend.remove(scope === 'all' ? t.seriesId : t.id); toast('Task deleted'); refresh(); }
-  catch (e) { state.tasks = backup; render(); handleError(e); }
+  try { await src(t).remove(scope === 'all' ? t.seriesId : t.id); toast('Task deleted'); refresh(); }
+  catch (e) { state.bySource.set(t.source, backup); rebuildTasks(); render(); handleError(e); }
   return true;
 }
 
@@ -459,11 +584,25 @@ async function rescheduleOverdue() {
   try {
     for (const t of list) {
       const ev = taskToEvent({ ...t }, { durationMin: CONFIG.DEFAULT_DURATION_MIN, includeRecurrence: false });
-      await state.backend.patch(t.id, { start: ev.start, end: ev.end });
+      await src(t).patch(t.id, { start: ev.start, end: ev.end });
     }
     toast(`Moved ${list.length} task${list.length === 1 ? '' : 's'} to today`);
   } catch (e) { handleError(e); }
   refresh();
+}
+
+// Move a task (or a whole repeating series) to another account
+async function moveTask(t, data, toId) {
+  const from = src(t); const to = state.sources.get(toId);
+  let payload = { ...data };
+  if (t.recurring) {
+    const master = ed.master || await from.get(t.seriesId);
+    const masterDate = (master.start.date || master.start.dateTime).slice(0, 10);
+    payload = { ...payload, done: false, date: data.date !== t.__origDate ? data.date : masterDate };
+  }
+  await to.insert(taskToEvent(payload, { durationMin: CONFIG.DEFAULT_DURATION_MIN }));
+  await from.remove(t.recurring ? t.seriesId : t.id);
+  toast(`Moved to ${sourceLabel(toId)}`);
 }
 
 // ===========================================================================
@@ -531,6 +670,13 @@ async function openEditor(task = null, defaults = {}) {
   ed.labels = [...(task?.labels || defaults.labels || [])];
   renderLabels();
   setRepeatFromRecurrence(null);
+  const accSel = $('#f-account');
+  accSel.innerHTML = [...state.sources.keys()].map((id) => {
+    const blocked = !canWrite(id);
+    return `<option value="${esc(id)}" ${blocked ? 'disabled' : ''}>${esc(sourceLabel(id))}${id === NO_ACCOUNT ? ' (private, not on a calendar)' : ''}${blocked ? ' — reconnect first' : ''}</option>`;
+  }).join('');
+  accSel.value = task?.source || (defaults.source && state.sources.has(defaults.source) ? defaults.source : defaultSource());
+  $('#account-field').hidden = state.sources.size < 2;
   $('#f-chips').innerHTML = '';
   $('#f-save').textContent = task ? 'Save' : 'Add task';
   $('#f-delete').hidden = !task;
@@ -542,7 +688,7 @@ async function openEditor(task = null, defaults = {}) {
   $('#f-name').focus();
   if (task?.recurring && task.seriesId) {
     try {
-      ed.master = await state.backend.get(task.seriesId);
+      ed.master = await src(task).get(task.seriesId);
       if (ed.task === task) setRepeatFromRecurrence(rruleToRecurrence(ed.master.recurrence));
     } catch (e) { console.warn(e); }
   }
@@ -582,28 +728,40 @@ async function saveEditor() {
     priority: ed.priority,
     recurrence: readRecurrence(),
     done: ed.task?.done || false,
+    source: $('#f-account').value || defaultSource(),
   };
   $('#editor').close();
 
-  if (ed.mode === 'add') return createTask(data);
+  if (ed.mode === 'add') {
+    localStorage.setItem(LS('defaultSource'), data.source);
+    return createTask(data);
+  }
 
   const t = ed.task;
   const scope = $('input[name=scope]:checked')?.value || 'this';
   const opts = { durationMin: CONFIG.DEFAULT_DURATION_MIN };
   const origDate = t.date;
-  Object.assign(t, data); render();
+  t.__origDate = origDate;
+  const moving = data.source !== t.source;
+  if (moving && t.recurring) {
+    const ok = await choose(`Move all occurrences of “${t.name}” to ${sourceLabel(data.source)}?`, [{ value: 'yes', label: 'Move the whole repeating task' }, { value: '', label: 'Cancel' }]);
+    if (!ok) return;
+  }
+  if (!moving) { Object.assign(t, { ...data, source: t.source }); render(); }
   try {
-    if (!t.recurring) {
-      await state.backend.patch(t.id, taskToEvent(data, opts));
+    if (moving) {
+      await moveTask(t, data, data.source);
+    } else if (!t.recurring) {
+      await src(t).patch(t.id, taskToEvent(data, opts));
     } else if (scope === 'this') {
-      await state.backend.patch(t.id, taskToEvent(data, { ...opts, includeRecurrence: false }));
+      await src(t).patch(t.id, taskToEvent(data, { ...opts, includeRecurrence: false }));
     } else {
-      const master = ed.master || await state.backend.get(t.seriesId);
+      const master = ed.master || await src(t).get(t.seriesId);
       const masterDate = (master.start.date || master.start.dateTime).slice(0, 10);
       const seriesDate = data.date !== origDate ? data.date : masterDate;
-      await state.backend.patch(t.seriesId, taskToEvent({ ...data, done: false, date: seriesDate }, opts));
+      await src(t).patch(t.seriesId, taskToEvent({ ...data, done: false, date: seriesDate }, opts));
     }
-    toast('Saved');
+    if (!moving) toast('Saved');
   } catch (e) { handleError(e); }
   refresh();
 }
@@ -625,38 +783,81 @@ function choose(text, options) {
 function openSettings() {
   let dlg = $('#settings');
   if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'settings'; dlg.className = 'settings'; document.body.appendChild(dlg); }
-  const demo = state.backend?.kind === 'demo';
+  const demo = state.mode === 'demo';
   const base = location.origin + location.pathname;
+  const accountRows = demo
+    ? [...state.sources.values()].filter((s) => s.id !== NO_ACCOUNT).map((s) => `<div class="acct-row"><span class="acct-dot" style="background:${s.color}"></span><span>${esc(s.id)}</span><small>demo</small></div>`).join('')
+    : state.accounts.map((a) => `<div class="acct-row"><span class="acct-dot" style="background:${a.color}"></span>
+        <span>${esc(a.email)}${state.expired.has(a.email) ? ' <small>(reconnect needed)</small>' : ''}${a.storage ? '<br><small>Also holds your “No account” tasks</small>' : ''}</span>
+        <div class="spacer"></div>
+        ${a.storage && state.accounts.length > 1 ? '' : `<button type="button" class="btn ghost danger" data-remove="${esc(a.email)}">Remove</button>`}
+      </div>`).join('');
   dlg.innerHTML = `<form method="dialog">
     <h2>Settings</h2>
-    <div>${demo ? 'Mode: <b>Demo</b> (tasks are stored only in this browser)' : `Connected to Google Calendar · calendar “<b>${esc(getCalendarName())}</b>”`}</div>
-    <label>Calendar name<input type="text" id="s-cal" value="${esc(getCalendarName())}"></label>
+    ${demo ? '<div>Mode: <b>Demo</b> (tasks are stored only in this browser)</div>' : ''}
+    <div class="field"><span>Google accounts</span>
+      <div class="acct-list">${accountRows || '<small>No accounts connected</small>'}</div>
+      ${demo ? '' : '<button type="button" class="btn ghost" id="s-add-account" style="align-self:flex-start;margin-top:6px">+ Add another Google account</button>'}
+    </div>
+    <label>New tasks go to (default)
+      <select id="s-default">${[...state.sources.keys()].map((id) => `<option value="${esc(id)}" ${id === defaultSource() ? 'selected' : ''}>${esc(sourceLabel(id))}</option>`).join('')}</select>
+    </label>
+    <label>Calendar name (in each account)<input type="text" id="s-cal" value="${esc(getCalendarName())}"></label>
     <label>Google OAuth Client ID<input type="text" id="s-client" value="${esc(getClientId())}" placeholder="…apps.googleusercontent.com"></label>
     <div class="kbd">
       <b>Shortcuts:</b> <kbd>q</kbd> add task · <kbd>/</kbd> search · <kbd>t</kbd> Today · <kbd>u</kbd> Upcoming · <kbd>r</kbd> sync<br>
-      <b>Quick add from anywhere:</b> open <code>${esc(base)}?add=Buy milk tomorrow p2</code><br>
+      <b>Quick add from anywhere:</b> open <code>${esc(base)}?add=Buy milk tomorrow p2</code> (goes to the default account)<br>
       <b>Quick add syntax:</b> dates (today, tomorrow, fri, Dec 15, in 3 days), times (5pm, 14:30), p1–p4, #label, every day / every mon, wed / every 2 weeks / until Dec 31, “// description”.
     </div>
+    <p id="s-err" class="error"></p>
     <div class="editor-foot">
-      ${demo ? '<button class="btn ghost" value="leave-demo">Leave demo mode</button>' : '<button class="btn ghost danger" value="signout">Sign out</button>'}
+      ${demo ? '<button class="btn ghost" value="leave-demo">Leave demo mode</button>' : '<button class="btn ghost danger" value="signout">Sign out of all</button>'}
       <div class="spacer"></div>
       <button class="btn ghost" value="cancel">Close</button>
       <button class="btn primary" value="save">Save</button>
     </div></form>`;
+
+  $('#s-add-account', dlg)?.addEventListener('click', async () => {
+    try {
+      const acct = await connectNewAccount();
+      buildSources(); dlg.close('cancel');
+      toast(`Connected ${acct.email}`);
+      await refresh();
+    } catch (e) { $('#s-err', dlg).textContent = e.message; }
+  });
+  $$('[data-remove]', dlg).forEach((b) => b.addEventListener('click', async () => {
+    const email = b.dataset.remove;
+    dlg.close('cancel');
+    const ok = await choose(`Disconnect ${email}? Its tasks stay in its Google Calendar; they just won't show here.`, [{ value: 'yes', label: 'Disconnect', cls: 'danger' }, { value: '', label: 'Cancel' }]);
+    if (!ok) return;
+    const acct = state.accounts.find((a) => a.email === email);
+    acct.signOut();
+    state.accounts = state.accounts.filter((a) => a !== acct);
+    state.expired.delete(email);
+    if (localStorage.getItem(LS('defaultSource')) === email) localStorage.removeItem(LS('defaultSource'));
+    persistAccounts();
+    if (!state.accounts.length) return location.reload();
+    buildSources(); rebuildTasks(); updateBanner(); render();
+  }));
+
   dlg.onclose = () => {
     const v = dlg.returnValue;
     if (v === 'save') {
+      localStorage.setItem(LS('defaultSource'), $('#s-default', dlg).value);
       const cal = $('#s-cal', dlg).value.trim(); const cid = $('#s-client', dlg).value.trim();
       const calChanged = cal && cal !== getCalendarName();
       if (cal) localStorage.setItem(LS('calendarName'), cal);
-      if (cid && cid !== getClientId()) { localStorage.setItem(LS('clientId'), cid); localStorage.removeItem(LS('token')); location.reload(); return; }
-      if (calChanged) { localStorage.removeItem(LS('calendarId')); location.reload(); }
+      if (cid && cid !== getClientId()) { localStorage.setItem(LS('clientId'), cid); state.accounts.forEach((a) => { a.token = null; }); persistAccounts(); location.reload(); return; }
+      if (calChanged) { state.accounts.forEach((a) => { a.calendarId = null; }); persistAccounts(); location.reload(); }
     } else if (v === 'signout') {
-      state.backend.signOut(); localStorage.removeItem(LS('calendarId')); location.reload();
+      state.accounts.forEach((a) => a.signOut());
+      localStorage.removeItem(LS('accounts')); localStorage.removeItem(LS('defaultSource'));
+      location.reload();
     } else if (v === 'leave-demo') {
       localStorage.removeItem(LS('mode')); location.reload();
     }
   };
+  dlg.returnValue = '';
   dlg.showModal();
 }
 
@@ -687,6 +888,7 @@ function wireUi() {
         const preset = a.dataset.preset ? JSON.parse(a.dataset.preset) : {};
         if (state.view.type.startsWith('priority:')) preset.priority ??= +state.view.type.split(':')[1];
         if (state.view.type.startsWith('label:')) preset.labels ??= [state.view.type.slice(6)];
+        if (state.view.type.startsWith('source:')) preset.source ??= state.view.type.slice(7);
         return openEditor(null, { date: a.dataset.date || undefined, ...preset });
       }
       if (act === 'toggle' && t) return toggleDone(t);
@@ -774,12 +976,7 @@ function toast(msg, actionLabel, action) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, actionLabel ? 5000 : 2500);
 }
-function showBanner(msg, btn, fn) {
-  const b = $('#banner'); b.hidden = false;
-  b.innerHTML = `<span>${esc(msg)}</span><button>${esc(btn)}</button>`;
-  b.querySelector('button').onclick = fn;
-}
-function hideBanner() { $('#banner').hidden = true; }
+
 
 // ===========================================================================
 // Demo data
@@ -787,24 +984,32 @@ function hideBanner() { $('#banner').hidden = true; }
 function seedDemo() {
   if (localStorage.getItem(LS('demoEvents'))) return;
   const td = today();
-  const mk = (s, d, extra = {}) => {
-    const p = parseQuickAdd(s, td);
-    return taskToEvent({ name: p.name, description: p.description, date: d ?? p.date ?? td, time: p.time, priority: p.priority, labels: p.labels, recurrence: p.recurrence, done: false, ...extra });
+  const mk = (str, d, extra = {}) => {
+    const p = parseQuickAdd(str, td);
+    const e = taskToEvent({ name: p.name, description: p.description, date: d ?? p.date ?? td, time: p.time, priority: p.priority, labels: p.labels, recurrence: p.recurrence, done: false, ...extra });
+    for (const k of ['start', 'end']) e[k] = Object.fromEntries(Object.entries(e[k]).filter(([, v]) => v != null));
+    if (!e.colorId) delete e.colorId;
+    if (!e.recurrence.length) delete e.recurrence;
+    return { ...e, id: 's' + Math.random().toString(36).slice(2, 10), status: 'confirmed' };
   };
-  const events = [
-    mk('Finish literature review section p1 #research // Cover the 2024–2026 RL papers', addDays(td, -1)),
-    mk('Lab meeting every monday 10am #lab'),
+  const put = (key, list) => localStorage.setItem(LS(key), JSON.stringify(list));
+  put('demoEvents', [
     mk('Reply to supervisor’s email today p2'),
     mk('Gym every mon, wed and fri 7am #health'),
-    mk('Submit expense report fri p3 #admin'),
-    mk('Paper draft deadline in 10 days p1 #research'),
     mk('Groceries tomorrow #personal'),
     mk('Water plants every 3 days #personal'),
     mk('Read one paper', td, { done: true }),
-  ].map((e, i) => ({ ...e, id: 'seed' + i, status: 'confirmed' }));
-  // MockBackend strips nulls on write; do the same here
-  for (const e of events) { for (const k of ['start', 'end']) e[k] = Object.fromEntries(Object.entries(e[k]).filter(([, v]) => v != null)); if (!e.colorId) delete e.colorId; if (!e.recurrence.length) delete e.recurrence; }
-  localStorage.setItem(LS('demoEvents'), JSON.stringify(events));
+  ]);
+  put('demoEvents2', [
+    mk('Finish literature review section p1 #research // Cover the 2024–2026 RL papers', addDays(td, -1)),
+    mk('Lab meeting every monday 10am #lab'),
+    mk('Submit expense report fri p3 #admin'),
+    mk('Paper draft deadline in 10 days p1 #research'),
+  ]);
+  put('demoNone', [
+    mk('Plan birthday surprise sat p2 #personal // Private: not on any calendar'),
+    mk('Journal every day 9pm #personal'),
+  ]);
 }
 
 boot();

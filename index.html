@@ -35,6 +35,10 @@
       <nav class="nav" id="nav-main"></nav>
       <div class="nav-heading">Priorities</div>
       <nav class="nav" id="nav-priorities"></nav>
+      <div id="accounts-wrap" hidden>
+        <div class="nav-heading">Accounts</div>
+        <nav class="nav" id="nav-accounts"></nav>
+      </div>
       <div class="nav-heading">Labels</div>
       <nav class="nav" id="nav-labels"></nav>
       <div class="sidebar-foot">
@@ -68,6 +72,12 @@
       <input id="f-name" class="f-name" placeholder="Task name — try “Submit report tomorrow 5pm p1 #lab”" required>
       <div id="f-chips" class="chips"></div>
       <textarea id="f-desc" class="f-desc" rows="3" placeholder="Description"></textarea>
+
+      <div class="fields" id="account-field">
+        <label class="field grow"><span>Account</span>
+          <select id="f-account"></select>
+        </label>
+      </div>
 
       <div class="fields">
         <label class="field"><span>Deadline</span>

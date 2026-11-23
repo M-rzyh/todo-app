@@ -1,21 +1,30 @@
-// Storage backends. Both expose the same interface:
-//   init()                     → ensures the To-Do calendar exists
-//   list(timeMin, timeMax)     → events (recurring ones expanded into instances)
-//   get(id) / insert(ev) / patch(id, partial) / remove(id)
+// Storage "sources". Every source exposes the same interface:
+//   id, label, kind, init(), list(timeMin, timeMax), get(id), insert(ev), patch(id, partial), remove(id)
 //
-// GoogleBackend talks to the Google Calendar API in the browser using a
-// Google Identity Services access token. MockBackend keeps everything in
-// localStorage (demo mode, and for testing without a Google account).
+// - CalendarSource: a "To-Do" calendar in one Google account (Google Calendar API)
+// - EventStore:     tasks kept as calendar-style events in a JSON blob, with the
+//                   recurrence expanded locally. Persisted either in Google Drive's
+//                   hidden app folder (synced "No account" tasks) or localStorage (demo).
+//
+// Accounts: several Google accounts can be connected. Each keeps its own access
+// token (Google Identity Services, ~1 hour) and its own To-Do calendar. One of
+// them (the "storage account") also holds the "No account" tasks in Drive.
 
 import { CONFIG } from './config.js';
 import { addDays, addMonths, parseYmd, ymd, WD_CODES, localTimeZone } from './dates.js';
 import { rruleToRecurrence } from './meta.js';
 
-const API = 'https://www.googleapis.com/calendar/v3';
-const SCOPE = 'https://www.googleapis.com/auth/calendar';
+const CAL_API = 'https://www.googleapis.com/calendar/v3';
+const DRIVE_API = 'https://www.googleapis.com/drive/v3';
+const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
+const SCOPE_CAL = 'https://www.googleapis.com/auth/calendar';
+const SCOPE_DRIVE = 'https://www.googleapis.com/auth/drive.appdata';
 const LS = (k) => `todo.${k}`;
+export const NO_ACCOUNT = 'none';
 
-export class AuthError extends Error {}
+export class AuthError extends Error {
+  constructor(msg, email) { super(msg); this.email = email; }
+}
 
 export function getClientId() {
   return localStorage.getItem(LS('clientId')) || CONFIG.GOOGLE_CLIENT_ID || '';
@@ -24,103 +33,153 @@ export function getCalendarName() {
   return localStorage.getItem(LS('calendarName')) || CONFIG.CALENDAR_NAME;
 }
 
+const ACCOUNT_COLORS = ['#dc4c3e', '#246fe0', '#058527', '#692ec2', '#eb8909', '#b8255f'];
+
 // ---------------------------------------------------------------------------
-export class GoogleBackend {
-  constructor() {
-    this.kind = 'google';
-    this.calendarId = localStorage.getItem(LS('calendarId'));
-    const saved = JSON.parse(localStorage.getItem(LS('token')) || 'null');
-    this.token = saved && saved.expires_at > Date.now() + 60000 ? saved : null;
-    this.tokenClient = null;
+// Accounts registry
+// ---------------------------------------------------------------------------
+export function loadAccounts() {
+  let list = JSON.parse(localStorage.getItem(LS('accounts')) || 'null');
+  if (!list) {
+    // Migrate from the single-account version
+    const token = JSON.parse(localStorage.getItem(LS('token')) || 'null');
+    const email = localStorage.getItem(LS('email'));
+    list = [];
+    // token is dropped on purpose: the account now also needs the Drive app-data
+    // permission (for "No account" tasks), so it reconnects once.
+    if (email || token) list.push({ email: email || '', calendarId: localStorage.getItem(LS('calendarId')), token: null, storage: true, color: ACCOUNT_COLORS[0] });
+    ['token', 'calendarId'].forEach((k) => localStorage.removeItem(LS(k)));
+    localStorage.setItem(LS('accounts'), JSON.stringify(list));
   }
+  return list.map((a) => new GoogleAccount(a));
+}
 
+export function saveAccounts(accounts) {
+  localStorage.setItem(LS('accounts'), JSON.stringify(accounts.map((a) => a.toJSON())));
+}
+
+export function nextColor(accounts) {
+  return ACCOUNT_COLORS.find((c) => !accounts.some((a) => a.color === c)) || ACCOUNT_COLORS[accounts.length % ACCOUNT_COLORS.length];
+}
+
+async function loadGis() {
+  if (window.google?.accounts?.oauth2) return;
+  await new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (window.google?.accounts?.oauth2) return resolve();
+      if (Date.now() - t0 > 10000) return reject(new Error('Could not load Google sign-in. Check your connection.'));
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+}
+
+export class GoogleAccount {
+  constructor({ email = '', calendarId = null, token = null, storage = false, color = ACCOUNT_COLORS[0] } = {}) {
+    Object.assign(this, { email, calendarId, token, storage, color });
+  }
+  toJSON() { const { email, calendarId, token, storage, color } = this; return { email, calendarId, token, storage, color }; }
+  get id() { return this.email; }
   hasValidToken() { return !!(this.token && this.token.expires_at > Date.now() + 60000); }
+  scopes() { return [SCOPE_CAL, ...(this.storage ? [SCOPE_DRIVE] : [])].join(' '); }
 
-  async loadGis() {
-    if (window.google?.accounts?.oauth2) return;
+  // Must run from a click (opens Google's popup). With `chooseAccount`, Google
+  // shows its account picker so a different account can be added.
+  async signIn({ chooseAccount = false } = {}) {
+    await loadGis();
     await new Promise((resolve, reject) => {
-      const t0 = Date.now();
-      const tick = () => {
-        if (window.google?.accounts?.oauth2) return resolve();
-        if (Date.now() - t0 > 10000) return reject(new Error('Could not load Google sign-in. Check your connection.'));
-        setTimeout(tick, 100);
-      };
-      tick();
-    });
-  }
-
-  // Must be called from a user gesture (click) the first time.
-  async signIn({ prompt = '' } = {}) {
-    await this.loadGis();
-    return new Promise((resolve, reject) => {
-      const hint = localStorage.getItem(LS('email')) || undefined;
-      this.tokenClient = google.accounts.oauth2.initTokenClient({
+      const client = google.accounts.oauth2.initTokenClient({
         client_id: getClientId(),
-        scope: SCOPE,
-        login_hint: hint,
+        scope: this.scopes(),
+        login_hint: !chooseAccount && this.email ? this.email : undefined,
+        prompt: chooseAccount ? 'select_account' : '',
         callback: (resp) => {
-          if (resp.error) return reject(new AuthError(resp.error_description || resp.error));
+          if (resp.error) return reject(new AuthError(resp.error_description || resp.error, this.email));
+          if (this.storage && !google.accounts.oauth2.hasGrantedAllScopes(resp, SCOPE_DRIVE)) {
+            return reject(new AuthError('Please tick the box allowing the app to store its own data in Google Drive (needed for “No account” tasks).', this.email));
+          }
           this.token = { access_token: resp.access_token, expires_at: Date.now() + (resp.expires_in - 60) * 1000 };
-          localStorage.setItem(LS('token'), JSON.stringify(this.token));
           resolve();
         },
-        error_callback: (err) => reject(new AuthError(err?.message || err?.type || 'Sign-in was cancelled')),
+        error_callback: (err) => reject(new AuthError(err?.message || err?.type || 'Sign-in was cancelled', this.email)),
       });
-      this.tokenClient.requestAccessToken({ prompt });
+      client.requestAccessToken();
     });
+    // Who did we just sign in as? The primary calendar's id is the account's email.
+    const primary = await this.req(`${CAL_API}/calendars/primary`);
+    this.email = primary.id;
   }
 
   signOut() {
     if (this.token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(this.token.access_token, () => {});
     this.token = null;
-    localStorage.removeItem(LS('token'));
   }
 
-  async req(path, { method = 'GET', body, query } = {}) {
-    if (!this.hasValidToken()) throw new AuthError('Session expired');
-    const url = new URL(API + path);
-    if (query) Object.entries(query).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
-    const res = await fetch(url, {
+  async req(url, { method = 'GET', body, query, raw = false, headers = {} } = {}) {
+    if (!this.hasValidToken()) throw new AuthError('Session expired', this.email);
+    const u = new URL(url);
+    if (query) Object.entries(query).forEach(([k, v]) => v != null && u.searchParams.set(k, v));
+    const isJson = body !== undefined && !raw;
+    const res = await fetch(u, {
       method,
-      headers: { Authorization: `Bearer ${this.token.access_token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      headers: { Authorization: `Bearer ${this.token.access_token}`, ...(isJson ? { 'Content-Type': 'application/json' } : {}), ...headers },
+      body: body === undefined ? undefined : isJson ? JSON.stringify(body) : body,
     });
-    if (res.status === 401) { this.token = null; localStorage.removeItem(LS('token')); throw new AuthError('Session expired'); }
+    if (res.status === 401) { this.token = null; throw new AuthError('Session expired', this.email); }
     if (res.status === 204) return null;
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `Google Calendar error ${res.status}`);
+    const text = await res.text();
+    let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (!res.ok) {
+      const msg = data?.error?.message || `Google error ${res.status}`;
+      if (res.status === 403 && /drive api has not been used|accessNotConfigured|is disabled/i.test(msg)) {
+        throw new Error('The Google Drive API is not enabled in your Google Cloud project yet (needed for “No account” tasks). See the README.');
+      }
+      throw new Error(msg);
+    }
     return data;
   }
+}
+
+// ---------------------------------------------------------------------------
+// A To-Do calendar in one Google account
+// ---------------------------------------------------------------------------
+export class CalendarSource {
+  constructor(account, onChange) {
+    this.account = account; this.onChange = onChange; this.kind = 'google';
+  }
+  get id() { return this.account.email; }
+  get label() { return this.account.email; }
+  get color() { return this.account.color; }
+  req(path, opts) { return this.account.req(CAL_API + path, opts); }
 
   async init() {
+    const a = this.account;
     const name = getCalendarName();
-    if (this.calendarId) {
-      try { await this.req(`/calendars/${encodeURIComponent(this.calendarId)}`); return; } catch (e) { if (e instanceof AuthError) throw e; }
+    if (a.calendarId) {
+      try { await this.req(`/calendars/${encodeURIComponent(a.calendarId)}`); return; } catch (e) { if (e instanceof AuthError) throw e; }
     }
     let pageToken; let found = null;
     do {
       const r = await this.req('/users/me/calendarList', { query: { minAccessRole: 'owner', pageToken } });
       found = r.items.find((c) => c.summary === name) || found;
-      const primary = r.items.find((c) => c.primary);
-      if (primary) localStorage.setItem(LS('email'), primary.id);
       pageToken = r.nextPageToken;
     } while (pageToken && !found);
     if (!found) {
       found = await this.req('/calendars', { method: 'POST', body: { summary: name, timeZone: localTimeZone(), description: 'Tasks from my To-Do app' } });
-      // Give it Todoist-red in the calendar list
       await this.req(`/users/me/calendarList/${encodeURIComponent(found.id)}`, { method: 'PATCH', query: { colorRgbFormat: true }, body: { backgroundColor: '#dc4c3e', foregroundColor: '#ffffff' } }).catch(() => {});
     }
-    this.calendarId = found.id;
-    localStorage.setItem(LS('calendarId'), found.id);
+    a.calendarId = found.id;
+    this.onChange?.();
   }
 
-  cal() { return `/calendars/${encodeURIComponent(this.calendarId)}/events`; }
+  cal() { return `/calendars/${encodeURIComponent(this.account.calendarId)}/events`; }
 
   async list(timeMin, timeMax) {
     const out = []; let pageToken;
     do {
       const r = await this.req(this.cal(), {
-        query: { singleEvents: true, orderBy: 'startTime', maxResults: 2500, timeMin: new Date(parseYmd(timeMin)).toISOString(), timeMax: new Date(parseYmd(timeMax)).toISOString(), pageToken },
+        query: { singleEvents: true, orderBy: 'startTime', maxResults: 2500, timeMin: parseYmd(timeMin).toISOString(), timeMax: parseYmd(timeMax).toISOString(), pageToken },
       });
       out.push(...r.items.filter((e) => e.status !== 'cancelled'));
       pageToken = r.nextPageToken;
@@ -135,16 +194,20 @@ export class GoogleBackend {
 }
 
 // ---------------------------------------------------------------------------
-// localStorage backend with a small RRULE expander (the subset this app writes)
-export class MockBackend {
-  constructor() { this.kind = 'demo'; this.key = LS('demoEvents'); }
-  load() { return JSON.parse(localStorage.getItem(this.key) || '[]'); }
-  save(list) { localStorage.setItem(this.key, JSON.stringify(list)); }
-  hasValidToken() { return true; }
-  async init() {}
+// Event store with local recurrence expansion. Every write re-reads the latest
+// copy first, so edits made on another device aren't overwritten.
+// ---------------------------------------------------------------------------
+export class EventStore {
+  constructor({ id, label, kind, color, persistence }) {
+    Object.assign(this, { id, label, kind, color, persistence });
+  }
+  async init() { await this.persistence.init?.(); }
+  load() { return this.persistence.load(); }
+  save(list) { return this.persistence.save(list); }
+  async mutate(fn) { const all = await this.load(); const res = await fn(all); await this.save(all); return res; }
 
   async list(timeMin, timeMax) {
-    const all = this.load(); const out = [];
+    const all = await this.load(); const out = [];
     const exceptions = new Map(all.filter((e) => e.recurringEventId).map((e) => [e.id, e]));
     for (const ev of all) {
       if (ev.recurringEventId) continue;
@@ -159,38 +222,74 @@ export class MockBackend {
     return out.sort((a, b) => startKey(a).localeCompare(startKey(b)));
   }
 
-  async get(id) {
-    const all = this.load();
-    const e = all.find((x) => x.id === id);
-    if (e) return e;
-    const m = id.match(/^(.*)_(\d{8})$/);
-    const master = m && all.find((x) => x.id === m[1]);
-    if (master) return instanceOf(master, `${m[2].slice(0, 4)}-${m[2].slice(4, 6)}-${m[2].slice(6)}`, id);
-    throw new Error('Not found');
+  async get(id) { return findOrInstance(await this.load(), id); }
+
+  insert(ev) {
+    return this.mutate((all) => {
+      const e = clean({ ...JSON.parse(JSON.stringify(ev)), id: 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), status: 'confirmed' });
+      all.push(e); return e;
+    });
   }
 
-  async insert(ev) {
-    const all = this.load();
-    const e = clean({ ...ev, id: 'd' + Math.random().toString(36).slice(2, 12), status: 'confirmed' });
-    all.push(e); this.save(all); return e;
+  patch(id, partial) {
+    return this.mutate((all) => {
+      let i = all.findIndex((x) => x.id === id);
+      if (i < 0) { all.push(findOrInstance(all, id)); i = all.length - 1; } // materialise an occurrence
+      all[i] = clean({ ...all[i], ...JSON.parse(JSON.stringify(partial)) });
+      return all[i];
+    });
   }
 
-  async patch(id, partial) {
-    const all = this.load();
-    let i = all.findIndex((x) => x.id === id);
-    if (i < 0) { all.push(await this.get(id)); i = all.length - 1; } // materialise an instance exception
-    all[i] = clean({ ...all[i], ...partial });
-    this.save(all); return all[i];
+  remove(id) {
+    return this.mutate((all) => {
+      const i = all.findIndex((x) => x.id === id);
+      const e = all[i];
+      if (e && !e.recurringEventId) { for (let k = all.length - 1; k >= 0; k--) if (all[k].id === id || all[k].recurringEventId === id) all.splice(k, 1); }
+      else if (e) e.status = 'cancelled';
+      else { const inst = findOrInstance(all, id); inst.status = 'cancelled'; all.push(inst); }
+      return null;
+    });
   }
+}
 
-  async remove(id) {
-    let all = this.load();
-    const e = all.find((x) => x.id === id);
-    if (e && !e.recurringEventId) all = all.filter((x) => x.id !== id && x.recurringEventId !== id);
-    else if (e) e.status = 'cancelled';
-    else { const inst = await this.get(id); inst.status = 'cancelled'; all.push(inst); }
-    this.save(all); return null;
+export class LocalPersistence {
+  constructor(key) { this.key = key; }
+  async load() { return JSON.parse(localStorage.getItem(this.key) || '[]'); }
+  async save(list) { localStorage.setItem(this.key, JSON.stringify(list)); }
+}
+
+// One JSON file in the hidden appDataFolder of the storage account's Drive.
+// Only this app can see it; it never appears in the user's Drive or calendars.
+export class DrivePersistence {
+  constructor(account) { this.account = account; this.fileId = null; }
+  async init() {
+    if (this.fileId) return;
+    const r = await this.account.req(`${DRIVE_API}/files`, { query: { spaces: 'appDataFolder', q: "name='tasks.json'", fields: 'files(id)' } });
+    if (r.files.length) { this.fileId = r.files[0].id; return; }
+    const boundary = 'todo' + Math.random().toString(36).slice(2);
+    const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name: 'tasks.json', parents: ['appDataFolder'] })}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n[]\r\n--${boundary}--`;
+    const f = await this.account.req(`${DRIVE_UPLOAD}/files`, { method: 'POST', query: { uploadType: 'multipart', fields: 'id' }, body, raw: true, headers: { 'Content-Type': `multipart/related; boundary=${boundary}` } });
+    this.fileId = f.id;
   }
+  async load() {
+    await this.init();
+    const data = await this.account.req(`${DRIVE_API}/files/${this.fileId}`, { query: { alt: 'media' } });
+    return Array.isArray(data) ? data : [];
+  }
+  async save(list) {
+    await this.init();
+    await this.account.req(`${DRIVE_UPLOAD}/files/${this.fileId}`, { method: 'PATCH', query: { uploadType: 'media' }, body: JSON.stringify(list), raw: true, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// ---------------------------------------------------------------------------
+function findOrInstance(all, id) {
+  const e = all.find((x) => x.id === id);
+  if (e) return e;
+  const m = id.match(/^(.*)_(\d{8})$/);
+  const master = m && all.find((x) => x.id === m[1]);
+  if (master) return instanceOf(master, `${m[2].slice(0, 4)}-${m[2].slice(4, 6)}-${m[2].slice(6)}`, id);
+  throw new Error('Task not found (it may have been deleted on another device)');
 }
 
 function clean(ev) {
@@ -209,8 +308,7 @@ function instanceOf(master, date, id) {
   inst.id = id; inst.recurringEventId = master.id;
   if (master.start.date) { inst.start = { date }; inst.end = { date: addDays(date, 1) }; }
   else {
-    const shift = (s) => date + s.slice(10);
-    inst.start = { ...master.start, dateTime: shift(master.start.dateTime) };
+    inst.start = { ...master.start, dateTime: date + master.start.dateTime.slice(10) };
     const dur = (new Date(master.end.dateTime) - new Date(master.start.dateTime)) / 60000;
     const end = new Date(new Date(inst.start.dateTime).getTime() + dur * 60000);
     inst.end = { ...master.end, dateTime: `${ymd(end)}T${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}:00` };
